@@ -3,71 +3,146 @@ import subprocess
 
 PALAVRAS_TXT = "palavras.txt"
 IMAGEM = "fundo.jpeg"
-AUDIO = "teste.mp3"
-VIDEO_TEMP = "video_temp.mp4"
+AUDIO = "ia.wav"
 VIDEO_FINAL = "video_final.mp4"
-FPS = 30
+FPS = 60
+
+import requests
+import os
+import hashlib
+from dotenv import dotenv_values
+
+config = dotenv_values(".env")
+PEXELS_API_KEY = config['PEXELS_KEY']
+PASTA_IMAGENS = "imagens_cache"
+
+os.makedirs(PASTA_IMAGENS, exist_ok=True)
+
+
+def baixar_imagem(keyword):
+    # cria nome fixo baseado na palavra (cache)
+    nome_arquivo = hashlib.md5(keyword.encode()).hexdigest() + ".jpg"
+    caminho = os.path.join(PASTA_IMAGENS, nome_arquivo)
+
+    # se já baixou antes, reutiliza
+    if os.path.exists(caminho):
+        return caminho
+
+    url = "https://api.pexels.com/v1/search"
+    headers = {"Authorization": PEXELS_API_KEY}
+    params = {"query": keyword, "per_page": 1}
+
+    response = requests.get(url, headers=headers, params=params)
+
+    if response.status_code != 200:
+        print("Erro ao buscar imagem:", response.text)
+        return None
+
+    data = response.json()
+
+    if not data["photos"]:
+        print("Nenhuma imagem encontrada para:", keyword)
+        return None
+
+    imagem_url = data["photos"][0]["src"]["large"]
+
+    img_data = requests.get(imagem_url).content
+    with open(caminho, "wb") as f:
+        f.write(img_data)
+
+    return caminho
+
 
 
 def limpar():
-    arquivos = [VIDEO_TEMP]
-    for a in arquivos:
-        if os.path.exists(a):
-            os.remove(a)
+    if os.path.exists(VIDEO_FINAL):
+        os.remove(VIDEO_FINAL)
 
 
 def ler_palavras(caminho):
-    palavras = []
+    eventos = []
+
     with open(caminho, "r", encoding="utf-8") as f:
         linhas = f.readlines()
 
     for i, linha in enumerate(linhas):
-        tempo, palavra = linha.strip().split(":", 1)
+        tempo, conteudo = linha.strip().split(":", 1)
         inicio = float(tempo.strip())
-        palavra = palavra.strip()
+        conteudo = conteudo.strip()
 
-        # define o fim como o início da próxima palavra
         if i < len(linhas) - 1:
             prox_tempo = float(linhas[i + 1].split(":")[0])
             fim = prox_tempo
         else:
-            fim = inicio + 0.6  # fallback da última palavra
+            fim = inicio + 0.6
 
-        palavras.append((inicio, fim, palavra))
+        # Detecta comando especial
+        if "[" in conteudo and "]" in conteudo:
+            comando = conteudo.split("[")[1].split("]")[0]
 
-    return palavras
+            if comando.lower() == "clean":
+                eventos.append((inicio, fim, "clean", None))
+            else:
+                eventos.append((inicio, fim, "image", baixar_imagem(comando)))
+        else:
+            eventos.append((inicio, fim, "text", conteudo))
 
-
-def adicionar_texto(palavras):
-    filtros = []
-
-    for inicio, fim, palavra in palavras:
-        filtros.append(
-            f"drawtext=text='{palavra}':"
-            f"fontcolor=white:fontsize=64:"
-            f"x=(w-text_w)/2:y=(h-text_h)/2:"
-            f"enable='between(t,{inicio},{fim})'"
-        )
-
-    return ",".join(filtros)
+    return eventos
 
 
-def adicionar_imagem():
-    return [
-        "ffmpeg",
-        "-y",
-        "-loop", "1",
-        "-i", IMAGEM,
-        "-t", "60",
-        "-vf", "scale=1280:720",
-        "-r", str(FPS),
-        VIDEO_TEMP
-    ]
+def escapar_texto(texto):
+    return (
+        texto.replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+    )
 
 
 def gerar_video():
-    palavras = ler_palavras(PALAVRAS_TXT)
-    filtros_texto = adicionar_texto(palavras)
+    eventos = ler_palavras(PALAVRAS_TXT)
+
+    filtros = []
+    filtro_base = "[0:v]scale=1280:720[base];"
+    ultimo_label = "[base]"
+    contador_img = 0
+
+    for inicio, fim, tipo, valor in eventos:
+
+        if tipo == "text":
+            texto = escapar_texto(valor)
+            label_out = f"[v{contador_img}]"
+
+            filtros.append(
+                f"{ultimo_label}drawtext=text='{texto}':"
+                f"fontcolor=white:fontsize=64:"
+                f"x=(w-text_w)/2:y=(h-text_h)/2:"
+                f"enable='between(t,{inicio},{fim})'"
+                f"{label_out};"
+            )
+
+            ultimo_label = label_out
+            contador_img += 1
+
+        elif tipo == "image":
+            label_img = f"[img{contador_img}]"
+            label_out = f"[v{contador_img}]"
+
+            filtros.append(
+                f"movie='{valor}',scale=400:-1{label_img};"
+                f"{ultimo_label}{label_img}overlay="
+                f"(W-w)/2:(H-h)/2:"
+                f"enable='between(t,{inicio},{fim})'"
+                f"{label_out};"
+            )
+
+            ultimo_label = label_out
+            contador_img += 1
+
+        elif tipo == "clean":
+            # Apenas não aplica overlay novo
+            continue
+
+    filtro_complexo = filtro_base + "".join(filtros)
 
     cmd = [
         "ffmpeg",
@@ -75,7 +150,9 @@ def gerar_video():
         "-loop", "1",
         "-i", IMAGEM,
         "-i", AUDIO,
-        "-vf", f"scale=1280:720,{filtros_texto}",
+        "-filter_complex", filtro_complexo,
+        "-map", ultimo_label,
+        "-map", "1:a",
         "-c:v", "libx264",
         "-preset", "fast",
         "-pix_fmt", "yuv420p",
